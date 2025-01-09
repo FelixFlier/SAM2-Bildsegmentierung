@@ -1,0 +1,123 @@
+import torch
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import os
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+def find_prominent_points(image, object_area_threshold=0.01):
+ 
+    # Konvertiere in Graustufen
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    
+    # Finde Konturen im Bild
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    image_area = image.shape[0] * image.shape[1]
+    positive_point = None
+    negative_point = None
+
+    for contour in contours:
+        # Berechne die Fläche der Kontur
+        area = cv2.contourArea(contour)
+        if area / image_area > object_area_threshold:  # Prüfe, ob sie groß genug ist
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                # Berechne Schwerpunkt der Kontur als positiven Punkt
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                positive_point = [cx, cy]
+                break
+    
+    # Wähle einen Punkt außerhalb der Konturen als negativen Punkt
+    if positive_point:
+        h, w = image.shape[:2]
+        for x in range(0, w, 10):
+            for y in range(0, h, 10):
+                inside_any_contour = cv2.pointPolygonTest(contours[0], (x, y), False)
+                if inside_any_contour < 0:  # Punkt liegt außerhalb
+                    negative_point = [x, y]
+                    break
+            if negative_point:
+                break
+    
+    return positive_point, negative_point
+
+def visualize_combined_segmentation(image, masks, positive_points=None, negative_points=None, box=None, output_path="output.png"):
+
+    overlay = image.copy()
+
+    # Zeichne positive Punkte (grün)
+    if positive_points:
+        for point in positive_points:
+            cv2.circle(overlay, tuple(point), 10, (0, 255, 0), -1)
+
+    # Zeichne negative Punkte (rot)
+    if negative_points:
+        for point in negative_points:
+            cv2.circle(overlay, tuple(point), 10, (255, 0, 0), -1)
+
+    # Zeichne die Box (blau)
+    if box:
+        cv2.rectangle(overlay, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+
+    # Überlagere die Masken
+    for mask in masks:
+        mask = (mask > 0).astype(np.uint8) * 255  # Binärmaske
+        color_mask = np.zeros_like(image)
+        color_mask[:, :, 0] = mask  # Rot für die Maske
+        overlay = cv2.addWeighted(overlay, 1, color_mask, 0.5, 0)
+
+    # Zeige das Bild
+    plt.figure(figsize=(10, 10))
+    plt.imshow(overlay)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+def main():
+    # Erstelle einen Ordner für die Ausgabe
+    output_dir = "output_segmentations"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # SAM2-Modell laden
+    predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
+
+    # Bild laden
+    image_path = "/home/jovyan/work/Assignement_06/Image_2.jpg"
+    image = load_image(image_path)
+
+    # Positive und Negative Points automatisch finden
+    positive_point, negative_point = find_prominent_points(image)
+    print(f"Positive Point: {positive_point}, Negative Point: {negative_point}")
+
+    # Box definieren 
+    box = [50, 50, image.shape[1] - 50, image.shape[0] - 50]
+
+    # Torch-Inferenz-Modus
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        # Positive Punkt-Segmentierung
+        masks_positive, _, _ = segment_with_point_prompts(predictor, image, positive_point)
+
+        # Negative Punkt-Segmentierung
+        masks_negative, _, _ = segment_with_point_prompts(predictor, image, positive_point, negative_point)
+
+        # Box-Segmentierung
+        masks_box = segment_with_box(predictor, image, box)
+
+        # Kombiniertes Bild visualisieren
+        combined_masks = [masks_positive[0], masks_negative[0], masks_box[0]]
+        combined_output_path = os.path.join(output_dir, f'combined_output_1.png')
+        visualize_combined_segmentation(
+            image,
+            combined_masks,
+            positive_points=[positive_point],
+            negative_points=[negative_point],
+            box=box,
+            output_path=combined_output_path
+        )
+
+if __name__ == '__main__':
+    main()
